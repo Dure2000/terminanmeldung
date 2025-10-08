@@ -23,7 +23,7 @@
 	const SMTP_PORT   = 587;
 	const SMTP_SECURE = 'tls'; // 'tls' (STARTTLS)
 	const SMTP_USER   = 'abi96.ekg.mwg@gmail.com'; // <- anpassen
-	const SMTP_PASS   = 'thqh wgql jafb uots';           // <- Google App-Passwort nutzen
+	const SMTP_PASS   = '';           // <- Google App-Passwort nutzen
 	const FROM_EMAIL  = SMTP_USER;                     // i.d.R. gleich dem Gmail-User
 	const FROM_NAME   = 'Orga-Team Abi 96';            // Anzeigename
 	
