@@ -8,7 +8,7 @@
 	// -----------------------------------------------
 	$DB_PATH    = __DIR__ . '/rsvp.sqlite'; // Pfad zur bestehenden DB aus rsvp.php
 	$APP_TITLE  = 'Teilnehmer-Editor';
-	const EDITOR_KEY = 'ekgmwgabi96';                 // z. B. 'gJ2k7wTn...'; Zugriff via editor.php?key=DEIN_KEY
+	const EDITOR_KEY = '';                 // z. B. 'gJ2k7wTn...'; Zugriff via editor.php?key=DEIN_KEY
 	const PAGE_SIZE  = 50;                 // Einträge pro Seite
 	
 	// -----------------------------------------------
