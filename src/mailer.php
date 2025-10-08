@@ -16,7 +16,7 @@
 	$APP_TITLE  = 'Mailer';
 	const MAILER_KEY = ''; // Zugriff via mailer.php?key=...
 	
-	// Mail-Passwort: $XCbd!&]}2)a_TN
+	// Mail-Passwort: 
 	
 	// SMTP / Absender (Gmail)
 	const SMTP_HOST   = 'smtp.gmail.com';
