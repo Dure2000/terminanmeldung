@@ -10,7 +10,7 @@
 	//-------------------------------------------------
 	$DB_PATH    = __DIR__ . '/rsvp.sqlite';
 	$APP_TITLE  = 'CSV-Importer';
-	const IMPORT_KEY = 'ekgmwgabi96'; // z.B. 'zX3...'; Aufruf: importer.php?key=DEIN_KEY
+	const IMPORT_KEY = ''; // z.B. 'zX3...'; Aufruf: importer.php?key=DEIN_KEY
 	const MAX_PREVIEW_ROWS = 50;  // für Mapping/Review, Performance
 	const UPLOAD_DIR = null;        // null => sys_get_temp_dir(); sonst absoluter Pfad
 	
