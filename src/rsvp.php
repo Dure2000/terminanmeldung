@@ -11,7 +11,7 @@
 	$CSV_PATH = __DIR__ . '/attendees.csv'; // optionaler Seed
 	$APP_TITLE = 'Abi 96 - 30 Jahre! – Anmeldung';
 	$FROM_NAME = 'Orga-Team';
-	$IBAN = "DE1548250110xxxxxxxxxx";
+	$IBAN = "";
 	
 	// Admin-Zugriff: leer lassen = ungeschützt (nicht empfohlen)
 	const ADMIN_KEY = ''; // z.B. 'A9k33f...'; Zugriff via ?admin=1&key=...
