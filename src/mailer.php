@@ -14,7 +14,7 @@
 	//-------------------------------------------------
 	$DB_PATH    = __DIR__ . '/rsvp.sqlite';
 	$APP_TITLE  = 'Mailer';
-	const MAILER_KEY = 'ekgmwgabi96'; // Zugriff via mailer.php?key=...
+	const MAILER_KEY = ''; // Zugriff via mailer.php?key=...
 	
 	// Mail-Passwort: $XCbd!&]}2)a_TN
 	
