@@ -1,0 +1,53 @@
+function seed_from_csv_if_empty() {
+		global $CSV_PATH;
+		$pdo = db();
+		$count = (int)$pdo->query('SELECT COUNT(*) FROM attendees')->fetchColumn();
+		if ($count > 0) return;
+		if (!is_readable($CSV_PATH)) return;
+		
+		if (($fh = fopen($CSV_PATH, 'r')) !== false) {
+			$header = fgetcsv($fh);
+			if ($header === false) { fclose($fh); return; }
+			$map = array_flip(array_map('strtolower', $header));
+			if (!isset($map['hash']) && !isset($map['token']) && !isset($map['vorname']) && !isset($map['email']) && !isset($map['e-mail-adresse'])) {
+				fclose($fh);
+				$fh = fopen($CSV_PATH, 'r');
+				$map = null;
+			}
+			
+			$stmt = $pdo->prepare('INSERT OR IGNORE INTO attendees (token, first_name, last_name, email, phone, status, paid, updated_at) VALUES (:token,:fn,:ln,:email,:phone,NULL,0,datetime("now"))');
+			while (($row = fgetcsv($fh)) !== false) {
+				if ($row === [null] || $row === false) continue;
+				if ($map) {
+					$get = function($keys) use ($row, $map) {
+						foreach ((array)$keys as $k) {
+							$k = strtolower($k);
+							if (isset($map[$k])) return trim((string)$row[$map[$k]]);
+						}
+						return '';
+					};
+					$token = $get(['hash','token']);
+					$fn	= $get(['vorname','first_name','firstname']);
+					$ln	= $get(['nachname','last_name','lastname']);
+					$email = $get(['email','e-mail-adresse']);
+					$phone = $get(['telefon','phone']);
+					} else {
+					$token = trim($row[0] ?? '');
+					$fn	= trim($row[1] ?? '');
+					$ln	= trim($row[2] ?? '');
+					$email = trim($row[3] ?? '');
+					$phone = trim($row[4] ?? '');
+				}
+				if ($token === '') continue;
+				$stmt->execute([
+				':token' => $token,
+				':fn'	=> $fn,
+				':ln'	=> $ln,
+				':email' => $email,
+				':phone' => $phone,
+				]);
+			}
+			fclose($fh);
+		}
+	}
+	

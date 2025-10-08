@@ -1,0 +1,711 @@
+<?php
+	// rsvp.php — Ein Datei-Skript zum Anmelden & Admin
+	// Author: Ralf Schwalbe, 01.10.2025
+	// Neu: Admin-Ansicht (Status/Bezahlt), CSV-Export
+	// setze unten ADMIN_KEY und nutze ?admin=1&key=<ADMIN_KEY>.
+	
+	// -----------------------------------------------
+	// Konfiguration
+	// -----------------------------------------------
+	$DB_PATH   = __DIR__ . '/rsvp.sqlite';
+	$CSV_PATH  = __DIR__ . '/attendees.csv'; // optionaler Seed
+	$APP_TITLE = 'Abi 96 - 30 Jahre! – Anmeldung';
+	$FROM_NAME = 'Orga-Team';
+	
+	// Admin-Zugriff: leer lassen = ungeschützt (nicht empfohlen)
+	const ADMIN_KEY = ''; // z.B. 'A9k33f...'; Zugriff via ?admin=1&key=...
+	
+	// -----------------------------------------------
+	// Hilfsfunktionen DB
+	// -----------------------------------------------
+	function db(): PDO {
+		global $DB_PATH;
+		static $pdo = null;
+		if ($pdo === null) {
+			$pdo = new PDO('sqlite:' . $DB_PATH);
+			$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+			$pdo->exec('PRAGMA foreign_keys = ON');
+		}
+		return $pdo;
+	}
+	
+	function init_db() {
+		$sql = <<<SQL
+		CREATE TABLE IF NOT EXISTS attendees (
+        token TEXT PRIMARY KEY,
+        first_name TEXT,
+        last_name TEXT,
+        email TEXT,
+        phone TEXT,
+        status TEXT, -- 'yes' | 'no' | NULL
+        paid INTEGER DEFAULT 0, -- 0|1
+        updated_at TEXT
+		);
+		SQL;
+		$pdo = db();
+		$pdo->exec($sql);
+		
+		// Migrations: Spalte paid nachrüsten, falls alte DB
+		if (!column_exists('attendees','paid')) {
+			$pdo->exec("ALTER TABLE attendees ADD COLUMN paid INTEGER DEFAULT 0");
+		}
+	}
+	
+	function column_exists($table,$col): bool {
+		$stmt = db()->prepare("PRAGMA table_info($table)");
+		$stmt->execute();
+		foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+			if (strcasecmp($row['name'],$col)===0) return true;
+		}
+		return false;
+	}
+	
+	function seed_from_csv_if_empty() {
+		global $CSV_PATH;
+		$pdo = db();
+		$count = (int)$pdo->query('SELECT COUNT(*) FROM attendees')->fetchColumn();
+		if ($count > 0) return;
+		if (!is_readable($CSV_PATH)) return;
+		
+		if (($fh = fopen($CSV_PATH, 'r')) !== false) {
+			$header = fgetcsv($fh);
+			if ($header === false) { fclose($fh); return; }
+			$map = array_flip(array_map('strtolower', $header));
+			if (!isset($map['hash']) && !isset($map['token']) && !isset($map['vorname']) && !isset($map['email']) && !isset($map['e-mail-adresse'])) {
+				fclose($fh);
+				$fh = fopen($CSV_PATH, 'r');
+				$map = null;
+			}
+			
+			$stmt = $pdo->prepare('INSERT OR IGNORE INTO attendees (token, first_name, last_name, email, phone, status, paid, updated_at) VALUES (:token,:fn,:ln,:email,:phone,NULL,0,datetime("now"))');
+			while (($row = fgetcsv($fh)) !== false) {
+				if ($row === [null] || $row === false) continue;
+				if ($map) {
+					$get = function($keys) use ($row, $map) {
+						foreach ((array)$keys as $k) {
+							$k = strtolower($k);
+							if (isset($map[$k])) return trim((string)$row[$map[$k]]);
+						}
+						return '';
+					};
+					$token = $get(['hash','token']);
+					$fn    = $get(['vorname','first_name','firstname']);
+					$ln    = $get(['nachname','last_name','lastname']);
+					$email = $get(['email','e-mail-adresse']);
+					$phone = $get(['telefon','phone']);
+					} else {
+					$token = trim($row[0] ?? '');
+					$fn    = trim($row[1] ?? '');
+					$ln    = trim($row[2] ?? '');
+					$email = trim($row[3] ?? '');
+					$phone = trim($row[4] ?? '');
+				}
+				if ($token === '') continue;
+				$stmt->execute([
+                ':token' => $token,
+                ':fn'    => $fn,
+                ':ln'    => $ln,
+                ':email' => $email,
+                ':phone' => $phone,
+				]);
+			}
+			fclose($fh);
+		}
+	}
+	
+	function get_attendee_by_token(string $token): ?array {
+		$stmt = db()->prepare('SELECT * FROM attendees WHERE token = :t');
+		$stmt->execute([':t' => $token]);
+		$row = $stmt->fetch(PDO::FETCH_ASSOC);
+		return $row ?: null;
+	}
+	
+	function upsert_attendee(array $data) {
+		if (empty($data['token'])) {
+			$data['token'] = bin2hex(random_bytes(16));
+		}
+		$sql = <<<SQL
+		INSERT INTO attendees (token, first_name, last_name, email, phone, status, paid, updated_at)
+		VALUES (:token, :fn, :ln, :email, :phone, :status, COALESCE(:paid,0), datetime('now'))
+		ON CONFLICT(token) DO UPDATE SET
+        first_name=excluded.first_name,
+        last_name=excluded.last_name,
+        email=excluded.email,
+        phone=excluded.phone,
+        status=COALESCE(excluded.status, attendees.status),
+        paid=COALESCE(excluded.paid, attendees.paid),
+        updated_at=datetime('now');
+		SQL;
+		$stmt = db()->prepare($sql);
+		$stmt->execute([
+        ':token'  => $data['token'],
+        ':fn'     => $data['first_name'] ?? '',
+        ':ln'     => $data['last_name'] ?? '',
+        ':email'  => $data['email'] ?? '',
+        ':phone'  => $data['phone'] ?? '',
+        ':status' => in_array($data['status'] ?? null, ['yes','no'], true) ? $data['status'] : null,
+        ':paid'   => isset($data['paid']) ? (int)!!$data['paid'] : null,
+		]);
+		return $data['token'];
+	}
+	
+	function set_paid(string $token, int $paid): void {
+		$stmt = db()->prepare("UPDATE attendees SET paid=:p, updated_at=datetime('now') WHERE token=:t");
+		$stmt->execute([':p'=>$paid, ':t'=>$token]);
+	}
+	
+	function h($s) { return htmlspecialchars((string)$s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
+	
+	// -----------------------------------------------
+	// Bootstrap + Session Flash
+	// -----------------------------------------------
+	session_start();
+	function flash($msg, $type='success') { $_SESSION['flash'] = ['msg'=>$msg, 'type'=>$type]; }
+	function get_flash() { if (!empty($_SESSION['flash'])) { $f=$_SESSION['flash']; unset($_SESSION['flash']); return $f; } return null; }
+	
+	// -----------------------------------------------
+	// Init
+	// -----------------------------------------------
+	init_db();
+	seed_from_csv_if_empty();
+	
+	// -----------------------------------------------
+	// Routing
+	// -----------------------------------------------
+	$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+	$token_param = trim($_GET['t'] ?? '');
+	$is_admin = (isset($_GET['admin']) && $_GET['admin'] == '1');
+	$admin_key_ok = (ADMIN_KEY === '' || (isset($_GET['key']) && hash_equals(ADMIN_KEY, (string)$_GET['key'])));
+	
+	if ($is_admin && !$admin_key_ok) {
+		http_response_code(403);
+		echo '<!doctype html><meta charset="utf-8"><div style="font:16px system-ui;padding:2rem">Zugriff verweigert. Admin-Key fehlt/ungültig.</div>';
+		exit;
+	}
+	
+	// Admin: Aktionen (POST)
+	if ($is_admin && $method === 'POST') {
+		if (isset($_POST['action']) && $_POST['action'] === 'toggle_paid' && !empty($_POST['token'])) {
+			$tok = (string)$_POST['token'];
+			$paid = (int)($_POST['paid'] ?? 0);
+			set_paid($tok, $paid);
+			if (!isset($_POST['ajax'])) {
+				flash('Bezahlstatus aktualisiert.', 'success');
+				header('Location: ' . $_SERVER['PHP_SELF'] . '?admin=1' . (ADMIN_KEY? '&key='.urlencode($_GET['key']??'') : ''));
+				exit;
+				} else {
+				header('Content-Type: application/json');
+				echo json_encode(['ok'=>true]);
+				exit;
+			}
+			} elseif (isset($_POST['action']) && $_POST['action'] === 'set_status' && !empty($_POST['token'])) {
+			$tok = (string)$_POST['token'];
+			$status = $_POST['status'] ?? null; // 'yes' | 'no' | '' (-> NULL)
+			$status = in_array($status, ['yes','no'], true) ? $status : null;
+			$stmt = db()->prepare("UPDATE attendees SET status=:s, updated_at=datetime('now') WHERE token=:t");
+			$stmt->execute([':s'=>$status, ':t'=>$tok]);
+			if (!isset($_POST['ajax'])) {
+				flash('Status aktualisiert.', 'success');
+				header('Location: ' . $_SERVER['PHP_SELF'] . '?admin=1' . (ADMIN_KEY? '&key='.urlencode($_GET['key']??'') : ''));
+				exit;
+				} else {
+				header('Content-Type: application/json');
+				echo json_encode(['ok'=>true, 'status'=>$status]);
+				exit;
+			}
+		}
+	}
+	
+	// Admin: CSV-Export
+	if ($is_admin && isset($_GET['export']) && $_GET['export']==='csv') {
+		header('Content-Type: text/csv; charset=utf-8');
+		header('Content-Disposition: attachment; filename="rsvp_export_' . date('Y-m-d_His') . '.csv"');
+		$out = fopen('php://output', 'w');
+		fputcsv($out, ['token','vorname','nachname','email','telefon','status','bezahlt','aktualisiert']);
+		$stmt = db()->query('SELECT token, first_name, last_name, email, phone, status, paid, updated_at FROM attendees ORDER BY last_name, first_name');
+		while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+			fputcsv($out, [
+            $row['token'], $row['first_name'], $row['last_name'], $row['email'], $row['phone'],
+            $row['status'], $row['paid'] ? '1' : '0', $row['updated_at']
+			]);
+		}
+		fclose($out);
+		exit;
+	}
+	
+	// Front: Formular-Submit
+	if (!$is_admin && $method === 'POST') {
+		$token  = trim($_POST['token'] ?? ($token_param ?: ''));
+		$fn     = trim($_POST['first_name'] ?? '');
+		$ln     = trim($_POST['last_name'] ?? '');
+		$email  = trim($_POST['email'] ?? '');
+		$phone  = trim($_POST['phone'] ?? '');
+		$status = $_POST['status'] ?? null; // 'yes' | 'no' | null
+		
+		if ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+			flash('Bitte eine gültige E‑Mail-Adresse eingeben.', 'danger');
+			} else {
+			$saved_token = upsert_attendee([
+            'token'      => $token,
+            'first_name' => $fn,
+            'last_name'  => $ln,
+            'email'      => $email,
+            'phone'      => $phone,
+            'status'     => $status,
+			]);
+			$msg = 'Daten gespeichert';
+			if ($status === 'yes') $msg = 'Danke! Wir freuen uns: Du kommst.';
+			if ($status === 'no')  $msg = 'Schade! Wir haben vermerkt, dass Du nicht kommst.';
+			flash($msg . ' (Dein Token: ' . $saved_token . ')', 'success');
+			$redir = $_SERVER['PHP_SELF'] . '?t=' . urlencode($saved_token);
+			header('Location: ' . $redir);
+			exit;
+		}
+	}
+	
+	// Daten für Front laden
+	$attendee = null;
+	if (!$is_admin && $token_param !== '') {
+		$attendee = get_attendee_by_token($token_param);
+	}
+	$prefill = [
+    'token'      => $attendee['token'] ?? '',
+    'first_name' => $attendee['first_name'] ?? '',
+    'last_name'  => $attendee['last_name'] ?? '',
+    'email'      => $attendee['email'] ?? '',
+    'phone'      => $attendee['phone'] ?? '',
+    'status'     => $attendee['status'] ?? null,
+    'paid'       => (int)($attendee['paid'] ?? 0),
+	];
+	$flash = get_flash();
+	
+	// -----------------------------------------------
+	// Views
+	// -----------------------------------------------
+	if ($is_admin) {
+		// Filter
+		$filter = $_GET['filter'] ?? 'all'; // all|yes|no|open|paid|unpaid
+		$q = trim($_GET['q'] ?? '');
+		$where = [];$params=[];
+		if ($filter==='yes') { $where[]='status = "yes"'; }
+		elseif ($filter==='no') { $where[]='status = "no"'; }
+		elseif ($filter==='open') { $where[]='status IS NULL'; }
+		elseif ($filter==='paid') { $where[]='paid = 1'; }
+		elseif ($filter==='unpaid') { $where[]='paid = 0'; }
+		if ($q !== '') {
+			$where[] = '(first_name LIKE :q OR last_name LIKE :q OR email LIKE :q)';
+			$params[':q'] = '%'.$q.'%';
+		}
+		$sql = 'SELECT * FROM attendees';
+		if ($where) $sql .= ' WHERE ' . implode(' AND ', $where);
+		$sql .= ' ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE';
+		$stmt = db()->prepare($sql);
+		$stmt->execute($params);
+		$rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+		$counts = [
+        'all'   => (int)db()->query('SELECT COUNT(*) FROM attendees')->fetchColumn(),
+        'yes'   => (int)db()->query("SELECT COUNT(*) FROM attendees WHERE status='yes'")->fetchColumn(),
+        'no'    => (int)db()->query("SELECT COUNT(*) FROM attendees WHERE status='no'")->fetchColumn(),
+        'open'  => (int)db()->query("SELECT COUNT(*) FROM attendees WHERE status IS NULL")->fetchColumn(),
+        'paid'  => (int)db()->query("SELECT COUNT(*) FROM attendees WHERE paid=1")->fetchColumn(),
+        'unpaid'=> (int)db()->query("SELECT COUNT(*) FROM attendees WHERE paid=0")->fetchColumn(),
+		];
+	?>
+    <!doctype html>
+    <html lang="de">
+		<head>
+			<meta charset="utf-8">
+			<meta name="viewport" content="width=device-width, initial-scale=1">
+			<title><?=h($APP_TITLE)?> · Admin</title>
+			<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" crossorigin="anonymous">
+			<style>
+				body { background:#f6f7fb; }
+				.card { margin: 1rem auto; max-width: 1280px; }
+				.badge-filter { text-transform: none; }
+				.table thead th { white-space: nowrap; }
+				.sticky-actions { position: sticky; right: 0; background: #fff; }
+			</style>
+		</head>
+		<body>
+			<div class="container">
+				<div class="card shadow-sm">
+					<div class="card-body p-4">
+						<div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
+							<h1 class="h4 mb-0">Adminbereich · <?=h($APP_TITLE)?></h1>
+							<div class="d-flex gap-2">
+								<a class="btn btn-outline-secondary" href="<?=h($_SERVER['PHP_SELF'])?>">Zur Formularansicht</a>
+								<a class="btn btn-primary" href="<?=h($_SERVER['PHP_SELF'])?>?admin=1<?= ADMIN_KEY? '&key='.urlencode($_GET['key']??''):'' ?>&export=csv">CSV exportieren</a>
+							</div>
+						</div>
+						
+						<?php if ($flash): ?>
+						<div class="alert alert-<?=h($flash['type'])?>" role="alert"><?=h($flash['msg'])?></div>
+						<?php endif; ?>
+						
+						<div class="row g-3 align-items-end mb-3">
+							<div class="col-md-3">
+								<label class="form-label">Filter</label>
+								<select class="form-select" id="filterSelect" onchange="applyFilter()">
+									<?php foreach(['all'=>'Alle','yes'=>'Zusage','no'=>'Absage','open'=>'Offen','paid'=>'Bezahlt','unpaid'=>'Unbezahlt'] as $k=>$label): ?>
+									<option value="<?=h($k)?>" <?= $filter===$k? 'selected':'' ?>><?=h($label)?> (<?= (int)$counts[$k] ?? 0 ?>)</option>
+									<?php endforeach; ?>
+								</select>
+							</div>
+							<div class="col-md-5">
+								<label class="form-label">Suche (Name oder E‑Mail)</label>
+								<input type="search" class="form-control" id="q" placeholder="Muster" value="<?=h($q)?>" onkeydown="if(event.key==='Enter'){applyFilter()}" />
+							</div>
+							<div class="col-md-4 text-md-end">
+								<button class="btn btn-outline-secondary" onclick="resetFilter()">Zurücksetzen</button>
+								<button class="btn btn-primary" onclick="applyFilter()">Anwenden</button>
+							</div>
+						</div>
+						
+						<div class="table-responsive">
+							<table class="table align-middle">
+								<thead>
+									<tr>
+										<th>Name</th>
+										<th>E‑Mail</th>
+										<th>Telefon</th>
+										<th>Status</th>
+										<th>Bezahlt</th>
+										<th>Aktualisiert</th>
+										<th class="text-end">Aktion</th>
+									</tr>
+								</thead>
+								<tbody>
+									<?php foreach ($rows as $r): ?>
+									<tr>
+										<td><?=h(trim(($r['first_name']??'') . ' ' . ($r['last_name']??'')))?></td>
+										<td><a href="mailto:<?=h($r['email'])?>"><?=h($r['email'])?></a></td>
+										<td><?=h($r['phone'])?></td>
+										<td id="status-<?=h($r['token'])?>">
+											<?php if ($r['status']==='yes'): ?>
+											<span class="badge text-bg-success badge-filter">Zusage</span>
+											<?php elseif ($r['status']==='no'): ?>
+											<span class="badge text-bg-danger badge-filter">Absage</span>
+											<?php else: ?>
+											<span class="badge text-bg-secondary badge-filter">Offen</span>
+											<?php endif; ?>
+										</td>
+										<td>
+											<div class="form-check form-switch">
+												<input class="form-check-input" type="checkbox" <?= $r['paid']? 'checked':'' ?> onchange="togglePaid('<?=h($r['token'])?>', this.checked)">
+											</div>
+										</td>
+										<td><span class="text-muted small"><?=h($r['updated_at'])?></span></td>
+										<td class="text-end d-flex gap-2 justify-content-end">
+											<a class="btn btn-sm btn-outline-secondary" target="_blank" href="<?=h($_SERVER['PHP_SELF'])?>?t=<?=h($r['token'])?>">Öffnen</a>
+											<button class="btn btn-sm btn-outline-warning" type="button" onclick="setStatus('<?=h($r['token'])?>','')">Neutral</button>
+										</td>
+									</tr>
+									<?php endforeach; ?>
+									<?php if (!$rows): ?>
+									<tr><td colspan="7" class="text-center text-muted">Keine Einträge</td></tr>
+									<?php endif; ?>
+								</tbody>
+							</table>
+						</div>
+					</div>
+				</div>
+			</div>
+			
+			<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" crossorigin="anonymous"></script>
+			<script>
+				function qs(k){const url=new URL(location.href);return url.searchParams.get(k)}
+				function applyFilter(){
+					const url=new URL(location.href);
+					url.searchParams.set('admin','1');
+					if (qs('key')) url.searchParams.set('key',qs('key'));
+					url.searchParams.set('filter', document.getElementById('filterSelect').value);
+					const q=document.getElementById('q').value.trim();
+					if (q) url.searchParams.set('q', q); else url.searchParams.delete('q');
+					location.href=url.toString();
+				}
+				function resetFilter(){
+					const url=new URL(location.href);
+					url.searchParams.set('admin','1');
+					if (qs('key')) url.searchParams.set('key',qs('key'));
+					['filter','q'].forEach(k=>url.searchParams.delete(k));
+					location.href=url.toString();
+				}
+				function togglePaid(token, checked){
+					const fd=new FormData();
+					fd.append('action','toggle_paid');
+					fd.append('token', token);
+					fd.append('paid', checked?1:0);
+					fd.append('ajax','1');
+					fetch(location.pathname + '?admin=1' + (qs('key')? '&key='+encodeURIComponent(qs('key')):''), {method:'POST', body:fd})
+					.then(r=>r.json()).catch(()=>{});
+				}
+				function setStatus(token, status){
+					const fd=new FormData();
+					fd.append('action','set_status');
+					fd.append('token', token);
+					fd.append('status', status);
+					fd.append('ajax','1');
+					fetch(location.pathname + '?admin=1' + (qs('key')? '&key='+encodeURIComponent(qs('key')):''), {method:'POST', body:fd})
+					.then(r=>r.json())
+					.then(data => {
+						const cell = document.getElementById('status-'+token);
+						if (!cell) return;
+						if (data && data.status === 'yes') {
+							cell.innerHTML = '<span class="badge text-bg-success badge-filter">Zusage</span>';
+							} else if (data && data.status === 'no') {
+							cell.innerHTML = '<span class="badge text-bg-danger badge-filter">Absage</span>';
+							} else {
+							cell.innerHTML = '<span class="badge text-bg-secondary badge-filter">Offen</span>';
+						}
+					})
+					.catch(()=>{});
+				}
+			</script>
+		</body>
+	</html>
+    <?php
+		exit;
+	}
+?>
+<!doctype html>
+<html lang="de">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<meta name="robots" content="noindex, nofollow">
+		<!--
+			Author: Ralf Schwalbe
+			Date: 2025-10-01
+			Version: 0.12
+			ToDo: 
+			- Verstecken von "zufällig finden", Hash-URL und HoneyPot?
+			- Verstecke Admin button
+			- Verstecke Liste bereits registrierter (Datenschutz, wenn ausgerollt).
+			- SQLite-Admin für manuelles Berbeiten der Daten ... 
+		-->
+		
+		<title><?=h($APP_TITLE)?></title>
+		<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" crossorigin="anonymous">
+		<style>
+			body { background: #f7f7f9; }
+			.card { max-width: 920px; margin: 1rem auto; }
+			.btn-xl { padding: 1rem 1.25rem; font-size: 1.1rem; }
+			button .small {font-size: 1rem}
+		</style>
+	</head>
+	<body>
+		<div class="container"><br>
+			
+			<div class="card shadow-sm">
+				<div class="card-body p-4 p-md-5"><img src="EKG.png" style="height: 70px;">&nbsp;&nbsp;&nbsp;&nbsp;<img src="MWG.png" style="height: 70px; "><br><br>
+					<h1 class="h3 mb-1"><?=h($APP_TITLE)?> 		<a href="rsvp.php" class="btn btn-outline-secondary" title="Wenn dir noch jemand einfällt, legen dies Person neu an. Bitte nicht die eigenen Daten mit einem anderen Namen überschreiben, sondern einen neuen Eintrag anlegen">Neuer Eintrag</a>
+					</h1>
+					<p class="text-muted mb-4">Unser Jahrgangsstufensteffen des Abi-Jahrgangs 1996 von MWG und EKG Lemgo findet am <strong>12.09.2026</strong> im Kesselhaus in Lemgo statt.<br>Bitte prüfe oder befülle Deine Daten und sag uns mit einem Klick, dass Du kommst.</p>
+					<?php if ($flash): ?>
+					<div class="alert alert-<?=h($flash['type'])?>" role="alert">
+						<?=h($flash['msg'])?>
+					</div>
+					<?php endif; ?>
+					
+					<?php if ($prefill['status'] === 'yes'): ?>
+					<div class="alert alert-success" role="alert">Status: <strong>Du kommst</strong> ✅</div>
+					<?php elseif ($prefill['status'] === 'no'): ?>
+					<div class="alert alert-warning" role="alert">Status: <strong>Du kommst nicht</strong> ❌</div>
+					<?php endif; ?>
+					
+					<?php if (!empty($prefill['token'])): ?>
+					<?php if (!empty($prefill['paid'])): ?>
+					<div class="alert alert-success" role="alert">Bezahlstatus: <strong>Zahlung eingegangen</strong> 💶✅</div>
+					<?php else: ?>
+					<div class="alert alert-secondary" role="alert">Bezahlstatus: <strong>Noch offen</strong> — bitte 75,00&nbsp;€ bis <strong>31.12.2025</strong> an IBAN <code>DE1548250110xxxxxxxxxx</code> überweisen.</div>
+					<?php endif; ?>
+					<?php endif; ?>
+					
+					<form id="rsvpForm" method="post" class="needs-validation" novalidate>
+						<input type="hidden" name="token" value="<?=h($prefill['token'])?>">
+						
+						<div class="row g-3">
+							<div class="col-md-6">
+								<label for="first_name" class="form-label">Vorname</label>
+								<input type="text" class="form-control" id="first_name" name="first_name" value="<?=h($prefill['first_name'])?>" required>
+								<div class="invalid-feedback">Bitte ausfüllen.</div>
+							</div>
+							<div class="col-md-6">
+								<label for="last_name" class="form-label">Nachname</label>
+								<input type="text" class="form-control" id="last_name" name="last_name" value="<?=h($prefill['last_name'])?>" >
+								<div class="invalid-feedback">Bitte ausfüllen.</div>
+							</div>
+							<div class="col-md-7">
+								<label for="email" class="form-label">E‑Mail</label>
+								<input type="email" class="form-control" id="email" name="email" value="<?=h($prefill['email'])?>" placeholder="">
+							</div>
+							<div class="col-md-5">
+								<label for="phone" class="form-label">Telefon</label>
+								<input type="text" class="form-control" id="phone" name="phone" value="<?=h($prefill['phone'])?>" placeholder="">
+							</div>
+						</div>
+						
+						
+						
+						<div class="d-grid gap-3 d-md-flex mt-4">
+							<button class="btn btn-success btn-lg flex-fill" type="submit" name="status" value="yes"><span class="small">Speichern mit "Ich komme"</span></button>
+							<!--<button class="btn btn-outline-secondary btn-xl" type="submit" name="status" value="">Nur speichern</button>-->
+							<button class="btn btn-danger btn-lg flex-fill" type="submit" name="status" value="no"><span class="small">Speichern mit "Ich komme nicht"</span></button>
+							<button class="btn btn-outline-secondary btn-lg" type="submit" name="status" value=""><span class="small">Nur Daten Speichern</span></button>
+						</div>
+						
+						
+						
+						<p class="mt-3 text-muted small">Du hast keinen persönlichen, sondern nur einen neutralen Link erhalten?<br>Kein Problem! – einfach die Felder ausfüllen und speichern (am besten mit „Ich komme“!).<br>Die Adresse im Browser nach dem Speichern kannst Du Dir dort oder hier unterhalb kopieren oder in deinen Favoriten speichern! Bitte überschreibt nicht einfach eventuell vorhandene Daten anderer, das wäre blöd!</p>
+						
+						<div class="mb-4">
+							<label for="shareUrl" class="form-label">Dein persönlicher Link (zum Kopieren - NACH dem Speichern)</label>
+							<div class="input-group">
+								<input type="url" class="form-control" id="shareUrl" readonly value="https://<?=h($_SERVER['SERVER_NAME'])?><?=h($_SERVER['PHP_SELF'])?>?t=<?=h($prefill['token']);?>">
+								<button class="btn btn-outline-secondary" type="button" id="btnCopyUrl">Kopieren</button>
+							</div>
+						</div>
+						<div class="d-flex gap-2 mt-2 flex-wrap">
+							<button class="btn btn-outline-primary btn-sm" type="button" id="btnSharePersonal">Diesen Link teilen</button>
+							<button class="btn btn-outline-primary btn-sm" type="button" id="btnShareNeutral">Neutralen Link teilen</button>
+						</div>
+						<div class="form-text">„Neutral“ = ohne persönlichen Token.</div>
+						<div class="alert alert-warning mt-3" role="alert">
+							<strong>Wichtig:</strong> Verbindlich wird Deine Anmeldung erst mit der Überweisung von <strong>75,00&nbsp;€</strong>
+							bis spätestens <strong>31.12.2025</strong> auf das Konto <strong>IBAN</strong>
+							<code>DE1548250110xxxxxxxxxx</code>. Wenn deine Zahlung gebucht ist, kannst du das auch hier einsehen!
+						</div>
+						<div class="alert alert-secondary" role="alert">
+							<div class="fw-semibold mb-1">Was steckt in den 75&nbsp;€?</div>
+							<div>Alles – von <em>Essen &amp; Getränken</em> über <em>Saalmiete</em> und <em>DJ</em> bis hin zu <em>Versicherung</em> und <em>Reinigung</em>. Kurz: Du kommst, wir kümmern uns. Du gehst, und es glänzt wieder – nur die Erinnerungen bleiben schön klebrig 😄.</div>
+						</div>
+						<hr><span class="text-danger small">Ab hier ist alles im Produktiv-Einsatz verborgen.</span><hr>
+						<div class="mt-4">
+							<?php if (ADMIN_KEY===''): ?>
+							<a class="btn btn-sm btn-outline-secondary" href="editor.php?key=ekgmwgabi96">Zur Admin-Ansicht</a>
+							<?php else: ?>
+							<span class="text-muted small">Admin-Ansicht: <code>?admin=1&amp;key=&lt;ADMIN_PASSWORD&gt;</code></span>
+							<?php endif; ?>
+						</div>
+					</form>
+					
+					<?php
+						// Liste bereits erfasster Personen ein-/ausblenden
+						// Steuerung: Konstante LIST_DEFAULT oder URL-Parameter ?list=1|0
+						if (!defined('LIST_DEFAULT')) { define('LIST_DEFAULT', true); }
+						$show_list = isset($_GET['list']) ? ($_GET['list'] === '1') : LIST_DEFAULT;
+						if ($show_list):
+						$stmt = db()->query("SELECT first_name, last_name, email, phone FROM attendees ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE");
+						$existing = $stmt->fetchAll(PDO::FETCH_ASSOC);
+					?>
+					<hr class="my-4">
+					<div class="d-flex align-items-center justify-content-between mb-2">
+						
+						<div class="small text-muted">Diese Liste ist nur für das Orga-Team gedacht. Über die URL steuerbar: <code>?list=1</code> anzeigen, <code>?list=0</code> ausblenden. würde ich auch rausnehmen, bevor es los geht!<br><strong>Bereits erfasst (<?=count($existing)?>)</strong></div>
+					</div>
+					<div class="table-responsive">
+						<table class="table table-sm">
+							<thead>
+								<tr>
+									<th>Vorname</th>
+									<th>Nachname</th>
+									<th>E‑Mail</th>
+									<th>Telefon</th>
+								</tr>
+							</thead>
+							<tbody>
+								<?php if ($existing): foreach ($existing as $e): ?>
+								<tr>
+									<td><?=h($e['first_name'])?></td>
+									<td><?=h($e['last_name'])?></td>
+									<td><?=h($e['email'])?></td>
+									<td><?=h($e['phone'])?></td>
+								</tr>
+								<?php endforeach; else: ?>
+								<tr><td colspan="4" class="text-muted">Noch keine Einträge</td></tr>
+								<?php endif; ?>
+							</tbody>
+						</table>
+					</div>
+					<?php endif; ?>
+					
+					<hr class="my-4">
+					<p class="mb-0 text-muted">Fragen? Melde Dich beim Orga‑Team. Grüße, <?=h($FROM_NAME)?>.</p>
+				</div>
+			</div>
+		</div>
+		
+		<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" crossorigin="anonymous"></script>
+		<script>
+			(() => {
+				'use strict';
+				const forms = document.querySelectorAll('.needs-validation');
+				Array.from(forms).forEach(form => {
+					form.addEventListener('submit', event => {
+						if (!form.checkValidity()) { event.preventDefault(); event.stopPropagation(); }
+						form.classList.add('was-validated');
+					}, false);
+				});
+			})();
+		</script>
+		<script>
+			// Kopieren & Teilen (Personal/Neutral)
+			(() => {
+				const input = document.getElementById('shareUrl');
+				const btnCopy = document.getElementById('btnCopyUrl');
+				const btnSharePersonal = document.getElementById('btnSharePersonal');
+				const btnShareNeutral  = document.getElementById('btnShareNeutral');
+				
+				// Links bestimmen
+				const current = new URL(window.location.href);
+				const token = (current.searchParams.get('t') || '').trim();
+				const personalUrl = (input && input.value) ? input.value : (token ? current.href : '');
+				const neutralUrl  = current.origin + current.pathname; // bewusst OHNE Token/Parameter
+				
+				// Input füllen, falls leer
+				if (input && (!input.value || /[?&]t=$/.test(input.value))) {
+					input.value = personalUrl || neutralUrl;
+				}
+				
+				function copyToClipboard(text, btn) {
+					if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+						navigator.clipboard.writeText(text).then(() => flash(btn), () => fallback());
+						} else {
+						fallback();
+					}
+					function fallback(){
+						const ta = document.createElement('textarea');
+						ta.value = text;
+						ta.setAttribute('readonly','');
+						ta.style.position = 'fixed'; ta.style.top = '-1000px';
+						document.body.appendChild(ta);
+						ta.select();
+						try { document.execCommand('copy'); flash(btn); }
+						catch(e){ alert('Kopieren nicht möglich. Bitte manuell kopieren.'); }
+						document.body.removeChild(ta);
+					}
+				}
+				function flash(btn){
+					if (!btn) return;
+					const old = btn.textContent; btn.textContent = 'Kopiert!';
+					setTimeout(() => btn.textContent = old, 1500);
+				}
+				async function share(url, title, text, fallbackBtn){
+					if (navigator.share) {
+						try { await navigator.share({title, text, url}); return; } catch(e){ /* abgebrochen */ }
+					}
+					copyToClipboard(url, fallbackBtn);
+				}
+				
+				if (btnCopy && input) btnCopy.addEventListener('click', () => copyToClipboard(input.value, btnCopy));
+				if (btnSharePersonal) btnSharePersonal.addEventListener('click', () => {
+					if (!personalUrl) { alert('Persönlicher Link noch nicht vorhanden. Bitte zuerst speichern.'); return; }
+					share(personalUrl, document.title, 'Mein persönlicher Anmeldelink', btnSharePersonal);
+				});
+				if (btnShareNeutral) btnShareNeutral.addEventListener('click', () => {
+					share(neutralUrl, document.title, 'Neutrale Anmeldeseite ohne Token', btnShareNeutral);
+				});
+			})();
+		</script>
+	</body>
+</html>
