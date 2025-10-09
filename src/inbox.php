@@ -1,6 +1,6 @@
 <?php
 $hostname = '{imap.gmail.com:993/imap/ssl}INBOX';
-$username = 'abi96.ekg.mwg@gmail.com';
+$username = '';
 $appPassword = ''; // 16 Zeichen App-Passwort
 
 $inbox = imap_open($hostname, $username, $appPassword);
